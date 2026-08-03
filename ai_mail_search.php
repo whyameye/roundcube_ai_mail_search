@@ -160,7 +160,7 @@ class ai_mail_search extends rcube_plugin
                     ],
                     'subject' => [
                         'type' => 'string',
-                        'description' => 'Keyword(s) expected in the subject line',
+                        'description' => 'An exact word/phrase you are confident would literally appear in the subject line, via IMAP\'s literal substring search (e.g. the user quoted or clearly named the actual wording). Do NOT put a paraphrase, category, or topic guess here (e.g. "artist submissions" when the real subject might be "New submission from OSL Artists") — a strict substring match will silently return nothing if the wording differs even slightly. For any topical/category/paraphrased request, leave this empty and set needs_content_review instead.',
                     ],
                     'body' => [
                         'type' => 'string',
@@ -168,7 +168,7 @@ class ai_mail_search extends rcube_plugin
                     ],
                     'needs_content_review' => [
                         'type' => 'boolean',
-                        'description' => 'True if satisfying the request requires actually reading message content, not just structural filters — e.g. "the email where Tyler talks about the website", "which one mentions the deadline", "find the one about the lease". False for purely structural requests (sender/subject/date/read status).',
+                        'description' => 'True if satisfying the request requires actually reading message content, not just structural filters — e.g. "the email where Tyler talks about the website", "which one mentions the deadline", "find the one about the lease", "artist submissions" (a category/topic, not a literal subject string). False for purely structural requests (sender/subject/date/read status). When true, prefer leaving subject/body empty too unless you are confident of the exact wording — otherwise that structural filter runs first and can zero out candidates before content review ever sees them.',
                     ],
                     'since' => [
                         'type' => 'string',
