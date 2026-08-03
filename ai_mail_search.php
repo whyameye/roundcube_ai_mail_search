@@ -246,7 +246,7 @@ class ai_mail_search extends rcube_plugin
                         ],
                         'body' => [
                             'type' => 'string',
-                            'description' => 'An exact word/phrase to literal-match in the message body. Same caveat as subject — only for wording you\'re confident is exact; otherwise leave empty and consider preview:true.',
+                            'description' => 'An exact word/phrase to literal-match in the message body. Same caveat as subject — only for wording you\'re confident is exact; otherwise leave empty and consider preview:true. Warning: this matches anywhere in the FULL raw message — quoted replies, forwarded chains, other people\'s signatures — not just content the sender themselves wrote, and not necessarily the topic at hand. A hit is not evidence of relevance by itself; only body_excerpt (truncated to the start of the message) is what you can actually see, so never include a result on the strength of a body/subject filter match alone if that excerpt doesn\'t itself show why it matches.',
                         ],
                         'since' => ['type' => 'string', 'description' => 'Only messages on or after this date, format YYYY-MM-DD'],
                         'before' => ['type' => 'string', 'description' => 'Only messages before this date, format YYYY-MM-DD'],
@@ -281,7 +281,7 @@ class ai_mail_search extends rcube_plugin
                     'properties' => [
                         'selected' => [
                             'type' => 'array',
-                            'description' => 'The final messages to show, in display order. Only uid/folder pairs actually returned by a previous search_emails call in this conversation — never invent one. An empty list is a valid, useful answer if nothing genuinely matches the request.',
+                            'description' => 'The final messages to show, in display order. Only uid/folder pairs actually returned by a previous search_emails call in this conversation — never invent one. For a content/topic request, only include a message if its own body_excerpt actually shows the relevant content — a body/subject filter match is not by itself evidence, since it can hit quoted text or someone else\'s signature elsewhere in the raw message that you never see. An empty list is a valid, useful answer if nothing you can actually confirm matches the request — prefer that over a guess.',
                             'items' => [
                                 'type' => 'object',
                                 'properties' => [
@@ -308,7 +308,14 @@ class ai_mail_search extends rcube_plugin
             . '(e.g. drop a literal subject/body guess, add preview:true to judge by content) and '
             . 'search again rather than presenting an empty or wrong answer on the first try. Apply '
             . 'anything in the request that affects ordering or count (e.g. "chronological order" '
-            . 'means oldest first, "just the last 3") when you present_results.';
+            . 'means oldest first, "just the last 3") when you present_results. For a request about '
+            . 'what someone said or a topic discussed, a body/subject filter matching is a hint to '
+            . 'investigate, not proof — it matches anywhere in the full raw message, including quoted '
+            . 'replies and other people\'s signatures, which can coincidentally contain your search '
+            . 'term with nothing to do with the actual request. Only present a message for a content '
+            . 'request if its body_excerpt itself visibly supports it; if you can\'t confirm that after '
+            . 'your searches, present_results with an empty list rather than guessing from a filter '
+            . 'match you can\'t actually verify.';
     }
 
     /**
