@@ -1,0 +1,157 @@
+/*
+ * Match Roundcube's own toolbar-button convention (see refresh/reply/delete):
+ * the "icon toolbar-button" classes make core Elastic CSS cancel the icon's
+ * default float and stack it above the label. We only need to supply the
+ * icon glyph itself; sizing/positioning already comes from core rules
+ * (a.toolbar-button:before{float:none!important;height:1.75rem!important;...}).
+ */
+a.button.ai-mail-search:before {
+  content: '';
+  width: 1.75rem !important;
+  height: 1.75rem !important;
+  margin: 0 auto !important;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+.ai-mail-search-panel {
+  display: none;
+  position: fixed;
+  top: 60px;
+  right: 20px;
+  width: 380px;
+  max-height: 70vh;
+  overflow-y: auto;
+  background: #fff;
+  color: #222;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  z-index: 10000;
+  font-size: 13px;
+}
+
+.ai-mail-search-panel.open {
+  display: block;
+}
+
+.ai-mail-search-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #e0e0e0;
+  font-weight: 600;
+}
+
+.ai-mail-search-close {
+  color: inherit;
+  text-decoration: none;
+  font-size: 18px;
+  line-height: 1;
+  opacity: 0.6;
+}
+
+.ai-mail-search-close:hover {
+  opacity: 1;
+}
+
+.ai-mail-search-form {
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px;
+}
+
+.ai-mail-search-input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.ai-mail-search-form button {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 4px;
+  background: #3a7bd5;
+  color: #fff;
+  cursor: pointer;
+}
+
+.ai-mail-search-form button:hover {
+  background: #2f66b3;
+}
+
+.ai-mail-search-status {
+  padding: 0 14px 8px;
+  color: #666;
+}
+
+.ai-mail-search-status.ai-mail-search-error {
+  color: #c0392b;
+}
+
+.ai-mail-search-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.ai-mail-search-result {
+  border-top: 1px solid #eee;
+}
+
+.ai-mail-search-result a {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 14px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.ai-mail-search-result a:hover {
+  background: #f2f6fc;
+}
+
+.ai-mail-search-subject {
+  font-weight: 600;
+}
+
+.ai-mail-search-from,
+.ai-mail-search-meta {
+  color: #666;
+  font-size: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ai-mail-search-panel {
+    background: #2b2e33;
+    color: #e6e6e6;
+    border-color: #444;
+  }
+
+  .ai-mail-search-header {
+    border-bottom-color: #444;
+  }
+
+  .ai-mail-search-input {
+    background: #1f2226;
+    color: #e6e6e6;
+    border-color: #555;
+  }
+
+  .ai-mail-search-result {
+    border-top-color: #3a3d42;
+  }
+
+  .ai-mail-search-result a:hover {
+    background: #33373d;
+  }
+
+  .ai-mail-search-from,
+  .ai-mail-search-meta,
+  .ai-mail-search-status {
+    color: #aaa;
+  }
+}

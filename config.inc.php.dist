@@ -1,0 +1,13 @@
+<?php
+
+// AI Mail Search plugin configuration
+// Copy this file to config.inc.php and fill in your Claude API key.
+
+// Required: your Claude API key (https://console.anthropic.com/settings/keys)
+$config['ai_mail_search_api_key'] = '';
+
+// Claude model used to extract search parameters from natural-language queries
+$config['ai_mail_search_model'] = 'claude-sonnet-5';
+
+// Maximum number of results returned per search
+$config['ai_mail_search_max_results'] = 25;
