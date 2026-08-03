@@ -4,12 +4,13 @@
  * AI Mail Search
  *
  * Adds a natural-language email search panel to Roundcube, backed by the
- * Claude Messages API. Claude extracts structured IMAP search parameters
- * (sender, subject, dates, ...) from the typed query, PHP runs the actual
- * search against the user's own authenticated IMAP session, and a second
- * Claude pass reviews the candidate results (headers, plus a truncated body
- * excerpt of each when the request needs actual content matching — e.g.
- * "the email where X talks about Y") to pick the final order/subset.
+ * Claude Messages API. Claude runs as a small agent: it gets a search_emails
+ * tool it can call multiple times against the user's own authenticated IMAP
+ * session — seeing real result counts and headers (and a body excerpt, on
+ * request, for topical matches) each time — and only finishes by calling
+ * present_results. That loop is what lets it recover from its own mistakes
+ * (e.g. a too-literal filter that returns nothing) by trying again, rather
+ * than a single one-shot guess with no way back.
  *
  * @license GNU GPL v3 or later
  */
@@ -25,8 +26,10 @@ class ai_mail_search extends rcube_plugin
     private const DEFAULT_MODEL = 'claude-sonnet-5';
     private const DEFAULT_MAX_RESULTS = 25;
     private const PER_FOLDER_CAP = 200;
-    private const CONTENT_REVIEW_FETCH_CAP = 20;
+    private const PREVIEW_FETCH_CAP = 15;
     private const EXCERPT_MAX_CHARS = 1500;
+    private const MAX_SEARCH_ROUNDS = 3;
+    private const CLAUDE_CALL_TIMEOUT = 15;
 
     public function init()
     {
@@ -76,43 +79,18 @@ class ai_mail_search extends rcube_plugin
         $model = (string) $this->rc->config->get('ai_mail_search_model', self::DEFAULT_MODEL);
         $max_results = (int) $this->rc->config->get('ai_mail_search_max_results', self::DEFAULT_MAX_RESULTS);
 
-        // this action can make up to two sequential Claude API calls plus, for
-        // content-matching requests, a round of per-message IMAP body fetches;
-        // give it more room than the default page-load budget
-        set_time_limit(90);
+        // the agent can make several sequential Claude calls (search, look at
+        // results, search again, ...) plus IMAP work each round; nginx's own
+        // proxy timeout to php-fpm here is 60s by default, so stay under that
+        set_time_limit(55);
 
         try {
-            $params = $this->extract_search_params($query, $api_key, $model);
             $storage = $this->rc->get_storage();
-            $criteria = $this->build_criteria($params);
-            $folders = $this->resolve_folders($storage, $params);
-            $sort = ($params['sort'] ?? '') === 'oldest_first' ? 'oldest_first' : 'newest_first';
-            $items = $this->run_search($storage, $criteria, $folders, $max_results, $sort);
+            $items = $this->run_agentic_search($query, $api_key, $model, $storage, $max_results);
         }
         catch (Exception $e) {
             $this->send_error($e->getMessage());
             return;
-        }
-
-        // content-matching requests ("the one where X talks about Y") need
-        // actual message text, not just headers — fetch a capped, truncated
-        // excerpt per candidate before handing them to the review pass
-        if (!empty($params['needs_content_review']) && $items) {
-            $items = array_slice($items, 0, self::CONTENT_REVIEW_FETCH_CAP);
-            $items = $this->fetch_excerpts($items);
-        }
-
-        // second pass: let Claude actually look at the candidates (and their
-        // content excerpt, if fetched above) and apply anything from the
-        // original request that isn't a raw IMAP filter — ordering, "just the
-        // last 3", "the one that talks about the website", etc. Falls back to
-        // the mechanically-sorted list if this call fails, so a hiccup here
-        // degrades gracefully instead of breaking search.
-        try {
-            $items = $this->review_results($query, $items, $api_key, $model);
-        }
-        catch (Exception $e) {
-            // ignore — keep the mechanical result
         }
 
         foreach ($items as &$item) {
@@ -135,86 +113,260 @@ class ai_mail_search extends rcube_plugin
     }
 
     /**
-     * Ask Claude to turn the natural-language query into structured IMAP
-     * search parameters via a forced tool call. No email content is sent.
+     * The agent loop. Round 1 is forced to search_emails (never let Claude
+     * "answer" before it has looked at anything real). After that it can
+     * search again or call present_results, up to MAX_SEARCH_ROUNDS searches,
+     * then it's forced to present_results with whatever it has seen so far.
+     * present_results is validated against every uid/folder actually
+     * returned by a real search_emails call in this session — Claude can't
+     * invent a result that was never seen.
      */
-    private function extract_search_params($query, $api_key, $model)
+    private function run_agentic_search($query, $api_key, $model, $storage, $max_results)
     {
-        $tools = [[
-            'name' => 'search_emails',
-            'description' => 'Search the user\'s mailbox using IMAP search criteria extracted from a natural-language request.',
-            'input_schema' => [
-                'type' => 'object',
-                'properties' => [
-                    'sender' => [
-                        'type' => 'string',
-                        'description' => 'Filter by sender name or email address. Only use this for a sender-only request (e.g. "emails from Tyler"). Do not also set "to" to the same person to mean "to or from" — use the "participant" field for that instead, since setting both ANDs them together and will match almost nothing.',
+        $tools = $this->agent_tools();
+        $system = $this->agent_system_prompt();
+        $messages = [['role' => 'user', 'content' => $query]];
+
+        $seen = [];       // "folder\x00uid" => full item, accumulated across every search_emails call
+        $last_found = []; // most recent search_emails result, as a last-resort fallback
+
+        for ($round = 1; $round <= self::MAX_SEARCH_ROUNDS; $round++) {
+            $tool_choice = $round === 1
+                ? ['type' => 'tool', 'name' => 'search_emails']
+                : ['type' => 'any', 'disable_parallel_tool_use' => true];
+
+            $data = $this->call_claude($api_key, $model, $system, $tools, $tool_choice, $messages);
+            $content = $data['content'] ?? [];
+            $tool_use = $this->first_tool_use($content);
+
+            if (!$tool_use) {
+                if (!$seen) {
+                    throw new Exception($this->gettext('apinotool'));
+                }
+                break;
+            }
+
+            if ($tool_use['name'] === 'present_results') {
+                return $this->resolve_selection($tool_use['input']['selected'] ?? [], $seen);
+            }
+
+            $found = $this->execute_search_emails($storage, (array) $tool_use['input'], $max_results);
+            $last_found = $found;
+            foreach ($found as $item) {
+                $seen[$item['folder'] . "\x00" . $item['uid']] = $item;
+            }
+
+            $messages[] = ['role' => 'assistant', 'content' => $content];
+            $messages[] = ['role' => 'user', 'content' => [[
+                'type' => 'tool_result',
+                'tool_use_id' => $tool_use['id'],
+                'content' => json_encode([
+                    'count' => count($found),
+                    'items' => $this->compact_items($found),
+                ]),
+            ]]];
+        }
+
+        // out of search rounds without a present_results call — ask once
+        // more, forced, so it synthesizes across everything it has seen
+        if ($seen) {
+            try {
+                $messages[] = [
+                    'role' => 'user',
+                    'content' => 'You are out of searches. Call present_results now with your final answer from what you have already seen.',
+                ];
+                $data = $this->call_claude($api_key, $model, $system, $tools, ['type' => 'tool', 'name' => 'present_results'], $messages);
+                $tool_use = $this->first_tool_use($data['content'] ?? []);
+                if ($tool_use && $tool_use['name'] === 'present_results') {
+                    return $this->resolve_selection($tool_use['input']['selected'] ?? [], $seen);
+                }
+            }
+            catch (Exception $e) {
+                // fall through to the mechanical fallback below
+            }
+        }
+
+        return $last_found;
+    }
+
+    private function first_tool_use(array $content)
+    {
+        foreach ($content as $block) {
+            if (($block['type'] ?? '') === 'tool_use') {
+                return $block;
+            }
+        }
+        return null;
+    }
+
+    private function resolve_selection(array $selected, array $seen)
+    {
+        $ordered = [];
+        foreach ($selected as $sel) {
+            $key = ($sel['folder'] ?? '') . "\x00" . ($sel['uid'] ?? '');
+            if (isset($seen[$key])) {
+                $ordered[] = $seen[$key];
+            }
+        }
+        return $ordered;
+    }
+
+    /**
+     * Tool definitions for the agent loop. Field-level guidance still steers
+     * Claude away from over-constraining a search up front, but that's now a
+     * quality nudge, not the only line of defense — the loop itself (see a
+     * bad result, try again) is what actually makes this resilient.
+     */
+    private function agent_tools()
+    {
+        return [
+            [
+                'name' => 'search_emails',
+                'description' => 'Search the user\'s mailbox. You can call this more than once (up to '
+                    . self::MAX_SEARCH_ROUNDS . ' times) — if a search returns nothing useful, or '
+                    . 'too much, adjust the parameters and search again rather than giving up.',
+                'input_schema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'sender' => [
+                            'type' => 'string',
+                            'description' => 'Filter by sender name or email address. Only for a sender-only request. Do not also set "to" to the same person to mean "to or from" — use "participant" instead.',
+                        ],
+                        'to' => [
+                            'type' => 'string',
+                            'description' => 'Filter by recipient name or email address. Only for a recipient-only request. See "participant" for "to or from" requests.',
+                        ],
+                        'participant' => [
+                            'type' => 'string',
+                            'description' => 'Name or email of someone who is sender, recipient, or cc\'d. Use for "to or from X", "involving X", "with X" — direction unspecified.',
+                        ],
+                        'subject' => [
+                            'type' => 'string',
+                            'description' => 'An exact word/phrase you\'re confident literally appears in the subject line — this is a strict substring match. If you\'re guessing at the wording (a paraphrase, category, or topic — e.g. "artist submissions" when the real subject might be "New submission from OSL Artists"), leave it empty instead: you\'ll see if the search comes back empty and can retry without it, or with preview:true to judge by content instead.',
+                        ],
+                        'body' => [
+                            'type' => 'string',
+                            'description' => 'An exact word/phrase to literal-match in the message body. Same caveat as subject — only for wording you\'re confident is exact; otherwise leave empty and consider preview:true.',
+                        ],
+                        'since' => ['type' => 'string', 'description' => 'Only messages on or after this date, format YYYY-MM-DD'],
+                        'before' => ['type' => 'string', 'description' => 'Only messages before this date, format YYYY-MM-DD'],
+                        'unread' => ['type' => 'boolean', 'description' => 'Only unread messages'],
+                        'flagged' => ['type' => 'boolean', 'description' => 'Only flagged/starred messages'],
+                        'folder' => ['type' => 'string', 'description' => 'Restrict to one folder, only if the user named one explicitly. Omit to search all folders.'],
+                        'sort' => [
+                            'type' => 'string',
+                            'enum' => ['newest_first', 'oldest_first'],
+                            'description' => 'Order of returned results. Default newest_first.',
+                        ],
+                        'preview' => [
+                            'type' => 'boolean',
+                            'description' => 'Set true to also fetch a truncated plain-text body excerpt of each result (up to '
+                                . self::PREVIEW_FETCH_CAP . ' messages), when you need to judge actual content or topic rather '
+                                . 'than just headers — e.g. "the one that talks about X". Costs more time; leave false for '
+                                . 'purely structural searches.',
+                        ],
+                        'limit' => [
+                            'type' => 'integer',
+                            'description' => 'Max messages to return, default ' . self::DEFAULT_MAX_RESULTS . '.',
+                        ],
                     ],
-                    'to' => [
-                        'type' => 'string',
-                        'description' => 'Filter by recipient name or email address. Only use this for a recipient-only request (e.g. "emails I sent to Tyler"). See "participant" for "to or from" requests.',
-                    ],
-                    'participant' => [
-                        'type' => 'string',
-                        'description' => 'Name or email address of someone who is the sender, a recipient, or cc\'d. Use this for phrasing like "to or from X", "involving X", "with X", "between me and X" — anything where the direction isn\'t specified. Do not also set sender/to to the same person.',
-                    ],
-                    'subject' => [
-                        'type' => 'string',
-                        'description' => 'An exact word/phrase you are confident would literally appear in the subject line, via IMAP\'s literal substring search (e.g. the user quoted or clearly named the actual wording). Do NOT put a paraphrase, category, or topic guess here (e.g. "artist submissions" when the real subject might be "New submission from OSL Artists") — a strict substring match will silently return nothing if the wording differs even slightly. For any topical/category/paraphrased request, leave this empty and set needs_content_review instead.',
-                    ],
-                    'body' => [
-                        'type' => 'string',
-                        'description' => 'An exact word/phrase to match in the message body via IMAP\'s literal substring search. Only set this when the user gave an exact word to search for. For topical/semantic requests like "the one about X" or "where they talk about Y", leave this empty and set needs_content_review instead — a strict substring match would likely miss the right message.',
-                    ],
-                    'needs_content_review' => [
-                        'type' => 'boolean',
-                        'description' => 'True if satisfying the request requires actually reading message content, not just structural filters — e.g. "the email where Tyler talks about the website", "which one mentions the deadline", "find the one about the lease", "artist submissions" (a category/topic, not a literal subject string). False for purely structural requests (sender/subject/date/read status). When true, prefer leaving subject/body empty too unless you are confident of the exact wording — otherwise that structural filter runs first and can zero out candidates before content review ever sees them.',
-                    ],
-                    'since' => [
-                        'type' => 'string',
-                        'description' => 'Only messages on or after this date, format YYYY-MM-DD',
-                    ],
-                    'before' => [
-                        'type' => 'string',
-                        'description' => 'Only messages before this date, format YYYY-MM-DD',
-                    ],
-                    'unread' => [
-                        'type' => 'boolean',
-                        'description' => 'Only unread messages',
-                    ],
-                    'flagged' => [
-                        'type' => 'boolean',
-                        'description' => 'Only flagged/starred messages',
-                    ],
-                    'folder' => [
-                        'type' => 'string',
-                        'description' => 'Restrict to one folder, only if the user explicitly names one (e.g. "Sent", "Drafts", "Inbox"). Omit to search all folders.',
-                    ],
-                    'sort' => [
-                        'type' => 'string',
-                        'enum' => ['newest_first', 'oldest_first'],
-                        'description' => 'Result order. Use "oldest_first" for phrasing like "chronological order", "in order", "oldest first". Default to "newest_first" (most recent first) otherwise.',
-                    ],
+                    'required' => [],
                 ],
-                'required' => [],
             ],
-        ]];
+            [
+                'name' => 'present_results',
+                'description' => 'Call this when you have enough information, from real search_emails results, to give the user their final answer.',
+                'input_schema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'selected' => [
+                            'type' => 'array',
+                            'description' => 'The final messages to show, in display order. Only uid/folder pairs actually returned by a previous search_emails call in this conversation — never invent one. An empty list is a valid, useful answer if nothing genuinely matches the request.',
+                            'items' => [
+                                'type' => 'object',
+                                'properties' => [
+                                    'uid' => ['type' => 'string'],
+                                    'folder' => ['type' => 'string'],
+                                ],
+                                'required' => ['uid', 'folder'],
+                            ],
+                        ],
+                    ],
+                    'required' => ['selected'],
+                ],
+            ],
+        ];
+    }
 
-        $system = 'Today\'s date is ' . gmdate('Y-m-d') . " (UTC). Extract IMAP search "
-            . 'parameters from the user\'s natural-language email search request. Resolve '
-            . 'relative dates ("last week", "this month", "yesterday") against today\'s date. '
-            . 'Always call the search_emails tool exactly once with your best-guess parameters '
-            . '— never ask a clarifying question, and omit any field you have no basis for.';
+    private function agent_system_prompt()
+    {
+        return 'Today\'s date is ' . gmdate('Y-m-d') . ' (UTC). Find the email(s) matching the '
+            . 'user\'s request by calling search_emails (up to ' . self::MAX_SEARCH_ROUNDS . ' times) '
+            . 'and, once you have looked at real results and are satisfied, present_results. Resolve '
+            . 'relative dates ("last week", "yesterday") against today\'s date. If a search returns '
+            . 'nothing, or clearly the wrong thing, don\'t give up — broaden or change the parameters '
+            . '(e.g. drop a literal subject/body guess, add preview:true to judge by content) and '
+            . 'search again rather than presenting an empty or wrong answer on the first try. Apply '
+            . 'anything in the request that affects ordering or count (e.g. "chronological order" '
+            . 'means oldest first, "just the last 3") when you present_results.';
+    }
 
+    /**
+     * Execute one search_emails tool call against real IMAP: build criteria,
+     * resolve folders, run the search, and (if requested) fetch excerpts.
+     */
+    private function execute_search_emails($storage, array $params, $default_max_results)
+    {
+        $criteria = $this->build_criteria($params);
+        $folders = $this->resolve_folders($storage, $params);
+        $sort = ($params['sort'] ?? '') === 'oldest_first' ? 'oldest_first' : 'newest_first';
+
+        $limit = isset($params['limit']) && is_numeric($params['limit']) ? (int) $params['limit'] : $default_max_results;
+        $limit = max(1, min($limit, $default_max_results));
+
+        $items = $this->run_search($storage, $criteria, $folders, $limit, $sort);
+
+        if (!empty($params['preview']) && $items) {
+            $items = array_slice($items, 0, self::PREVIEW_FETCH_CAP);
+            $items = $this->fetch_excerpts($items);
+        }
+
+        return $items;
+    }
+
+    /**
+     * Strip internal-only fields before sending a search result back to
+     * Claude as a tool_result.
+     */
+    private function compact_items(array $items)
+    {
+        return array_map(function ($item) {
+            $compact = [
+                'uid' => $item['uid'],
+                'folder' => $item['folder'],
+                'subject' => $item['subject'],
+                'from' => $item['from'],
+                'date' => $item['date'],
+            ];
+            if (isset($item['excerpt'])) {
+                $compact['body_excerpt'] = $item['excerpt'];
+            }
+            return $compact;
+        }, $items);
+    }
+
+    /**
+     * Shared Claude Messages API caller used by the agent loop.
+     */
+    private function call_claude($api_key, $model, $system, array $tools, array $tool_choice, array $messages)
+    {
         $payload = [
             'model' => $model,
-            'max_tokens' => 1024,
+            'max_tokens' => 4096,
             'system' => $system,
             'tools' => $tools,
-            'tool_choice' => ['type' => 'tool', 'name' => 'search_emails'],
-            'messages' => [
-                ['role' => 'user', 'content' => $query],
-            ],
+            'tool_choice' => $tool_choice,
+            'messages' => $messages,
         ];
 
         $ch = curl_init(self::API_URL);
@@ -227,7 +379,7 @@ class ai_mail_search extends rcube_plugin
                 'anthropic-version: ' . self::ANTHROPIC_VERSION,
             ],
             CURLOPT_POSTFIELDS => json_encode($payload),
-            CURLOPT_TIMEOUT => 30,
+            CURLOPT_TIMEOUT => self::CLAUDE_CALL_TIMEOUT,
         ]);
 
         $raw = curl_exec($ch);
@@ -247,17 +399,11 @@ class ai_mail_search extends rcube_plugin
             throw new Exception($this->gettext('apierror') . ' ' . $msg);
         }
 
-        foreach (($data['content'] ?? []) as $block) {
-            if (($block['type'] ?? '') === 'tool_use' && ($block['name'] ?? '') === 'search_emails') {
-                return (array) $block['input'];
-            }
-        }
-
-        throw new Exception($this->gettext('apinotool'));
+        return $data;
     }
 
     /**
-     * Build an RFC 3501 IMAP SEARCH criteria string from extracted params.
+     * Build an RFC 3501 IMAP SEARCH criteria string from search_emails params.
      */
     private function build_criteria(array $params)
     {
@@ -307,8 +453,8 @@ class ai_mail_search extends rcube_plugin
 
     /**
      * Determine which folder(s) to search. Honors an explicit folder name
-     * from the extracted params (matched against real + special folders);
-     * otherwise searches every folder except Trash and Junk.
+     * from the params (matched against real + special folders); otherwise
+     * searches every folder except Trash and Junk.
      */
     private function resolve_folders($storage, array $params)
     {
@@ -377,9 +523,9 @@ class ai_mail_search extends rcube_plugin
             }
         }
 
-        // always select the most recent $max_results matches first, so a
-        // "chronological order" request re-orders that set rather than
-        // surfacing unrelated old mail that happens to match the filters
+        // always select the most recent $max_results matches first, so
+        // oldest_first re-orders that set rather than surfacing unrelated
+        // old mail that happens to match the filters
         usort($all, function ($a, $b) {
             return $b['timestamp'] <=> $a['timestamp'];
         });
@@ -394,8 +540,8 @@ class ai_mail_search extends rcube_plugin
     }
 
     /**
-     * Fetch a plain-text excerpt of each candidate's body, for requests that
-     * need actual content matching. Uses Roundcube's own message parser
+     * Fetch a plain-text excerpt of each candidate's body, for search_emails
+     * calls made with preview:true. Uses Roundcube's own message parser
      * (handles multipart/HTML-to-text), truncated so token cost stays small.
      */
     private function fetch_excerpts(array $items)
@@ -419,142 +565,5 @@ class ai_mail_search extends rcube_plugin
         unset($item);
 
         return $items;
-    }
-
-    /**
-     * Second Claude pass: hand back the candidates (headers, plus a body
-     * excerpt of each when fetch_excerpts() was run) plus the user's original
-     * wording, and let Claude pick the final order/subset. Handles anything
-     * that isn't a raw IMAP filter — "chronological order", "just the last
-     * 3", "the one that talks about the website", etc. An empty selection is
-     * a valid, meaningful answer ("checked, none match") and is respected as
-     * such — only an actual call failure falls back to the mechanical list,
-     * and that fallback happens one level up in action_search().
-     */
-    private function review_results($query, array $items, $api_key, $model)
-    {
-        if (!$items) {
-            return $items;
-        }
-
-        $has_excerpts = isset($items[0]['excerpt']);
-
-        $candidates = array_map(function ($item) use ($has_excerpts) {
-            $candidate = [
-                'uid' => $item['uid'],
-                'folder' => $item['folder'],
-                'subject' => $item['subject'],
-                'from' => $item['from'],
-                'date' => gmdate('Y-m-d H:i', $item['timestamp']) . ' UTC',
-            ];
-            if ($has_excerpts) {
-                $candidate['body_excerpt'] = $item['excerpt'];
-            }
-            return $candidate;
-        }, $items);
-
-        $tools = [[
-            'name' => 'select_results',
-            'description' => 'Choose and order the final set of matching messages to show the user, from the given candidates.',
-            'input_schema' => [
-                'type' => 'object',
-                'properties' => [
-                    'selected' => [
-                        'type' => 'array',
-                        'description' => 'Candidate messages to show, in final display order. Only include uid/folder pairs that appear in the candidate list — never invent one.',
-                        'items' => [
-                            'type' => 'object',
-                            'properties' => [
-                                'uid' => ['type' => 'string'],
-                                'folder' => ['type' => 'string'],
-                            ],
-                            'required' => ['uid', 'folder'],
-                        ],
-                    ],
-                ],
-                'required' => ['selected'],
-            ],
-        ]];
-
-        $system = 'Today\'s date is ' . gmdate('Y-m-d') . ' (UTC). An IMAP search already ran for '
-            . 'the user\'s request below; the candidates are what matched, currently sorted '
-            . 'most-recent-first. Apply anything in the original request that affects which '
-            . 'candidates to show or what order to show them in — sorting (e.g. "chronological '
-            . 'order" means oldest first), a specific count ("just the last 3"), or filtering by '
-            . 'sender/subject/date already visible. If nothing like that applies, keep the given '
-            . 'order and return every candidate unchanged. Only return uid/folder pairs copied '
-            . 'exactly from the candidate list — never invent one.'
-            . ($has_excerpts
-                ? ' Each candidate includes a body_excerpt (truncated plain text of the message). '
-                    . 'Use it to judge which candidates actually satisfy the request — e.g. for "the '
-                    . 'email where X talks about Y", only select messages whose excerpt supports that. '
-                    . 'If none of the candidates genuinely match, return an empty selected list rather '
-                    . 'than guessing — that is a valid, useful answer.'
-                : '');
-
-        $payload = [
-            'model' => $model,
-            'max_tokens' => 4096,
-            'system' => $system,
-            'tools' => $tools,
-            'tool_choice' => ['type' => 'tool', 'name' => 'select_results'],
-            'messages' => [
-                ['role' => 'user', 'content' => "Original request: " . $query . "\n\nCandidates (JSON):\n" . json_encode($candidates)],
-            ],
-        ];
-
-        $ch = curl_init(self::API_URL);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
-                'content-type: application/json',
-                'x-api-key: ' . $api_key,
-                'anthropic-version: ' . self::ANTHROPIC_VERSION,
-            ],
-            CURLOPT_POSTFIELDS => json_encode($payload),
-            CURLOPT_TIMEOUT => 25,
-        ]);
-
-        $raw = curl_exec($ch);
-        $errno = curl_errno($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        if ($errno || $http_code != 200) {
-            throw new Exception('review call failed');
-        }
-
-        $data = json_decode($raw, true);
-        $selected = null;
-
-        foreach (($data['content'] ?? []) as $block) {
-            if (($block['type'] ?? '') === 'tool_use' && ($block['name'] ?? '') === 'select_results') {
-                $selected = $block['input']['selected'] ?? null;
-                break;
-            }
-        }
-
-        if (!is_array($selected)) {
-            throw new Exception('review call returned no selection');
-        }
-
-        $index = [];
-        foreach ($items as $item) {
-            $index[$item['folder'] . "\x00" . $item['uid']] = $item;
-        }
-
-        $ordered = [];
-        foreach ($selected as $sel) {
-            $key = ($sel['folder'] ?? '') . "\x00" . ($sel['uid'] ?? '');
-            if (isset($index[$key])) {
-                $ordered[] = $index[$key];
-            }
-        }
-
-        // trust the selection as-is, including an intentionally empty one —
-        // that means Claude checked and nothing genuinely matched, which is
-        // a real answer, not a failure to fall back from
-        return $ordered;
     }
 }

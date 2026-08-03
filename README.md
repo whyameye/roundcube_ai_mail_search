@@ -1,11 +1,16 @@
 # AI Mail Search
 
 Natural-language email search for Roundcube, backed by the Claude Messages
-API. A toolbar button opens a search panel; Claude turns your typed query
-into structured IMAP search parameters (sender, subject, dates, ...), and
-the search itself runs locally against your already-authenticated IMAP
-session. Only the typed query goes to Claude — message bodies and full
-results never leave your Roundcube server.
+API. A toolbar button opens a search panel; Claude runs as a small agent
+with a `search_emails` tool it can call more than once against your
+already-authenticated IMAP session — seeing real result counts and headers
+each time, so it can broaden or adjust a search that came back empty or
+wrong instead of guessing once and giving up — and finishes by calling
+`present_results`. By default only structural details (sender, subject,
+dates, folder) are involved; if a request needs actual content matching
+(e.g. "the email where X talks about Y"), Claude can ask for a truncated
+plain-text excerpt of candidate messages, which does leave your server as
+part of that request.
 
 ## Deploy (this server)
 
@@ -53,10 +58,20 @@ else on the server is touched.
 
 1. Click "AI Search" in the mail toolbar.
 2. Type a query, e.g. *"emails from Kaitlyn about the grant since June"*.
-3. The plugin sends only that text to Claude with a forced tool call
-   (`search_emails`), asking it to extract sender/subject/date/etc.
-4. The PHP backend builds an IMAP `SEARCH` command from Claude's output and
-   runs it against your existing Roundcube IMAP session (no separate
-   credentials, respects your folder access).
-5. Matching messages (folder, subject, from, date) are returned and
-   rendered in the panel; click a result to open it in Roundcube.
+3. Claude calls `search_emails` with structured parameters (sender, subject,
+   dates, folder, ...); the PHP backend builds an IMAP `SEARCH` command from
+   them and runs it against your existing Roundcube IMAP session (no
+   separate credentials, respects your folder access) — headers only,
+   unless Claude also set `preview: true` because the request needs actual
+   content matching, in which case a truncated plain-text excerpt of each
+   candidate is fetched too.
+4. Claude sees the real result count and headers (and excerpts, if
+   requested) back as a tool result. If it's empty or clearly wrong, it can
+   call `search_emails` again with different parameters — up to 3 times —
+   rather than settling for a bad first guess.
+5. Once satisfied, Claude calls `present_results` with the final ordered
+   list. Only messages that were actually returned by a real search in this
+   session can be included — the results panel validates this and would
+   never render something Claude merely claimed.
+6. Matching messages (folder, subject, from, date) are rendered in the
+   panel; click a result to open it in Roundcube's own reading pane.
