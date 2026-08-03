@@ -28,7 +28,7 @@ class ai_mail_search extends rcube_plugin
     private const PER_FOLDER_CAP = 200;
     private const PREVIEW_FETCH_CAP = 15;
     private const EXCERPT_MAX_CHARS = 1500;
-    private const MAX_SEARCH_ROUNDS = 3;
+    private const MAX_SEARCH_ROUNDS = 4;
     private const CLAUDE_CALL_TIMEOUT = 15;
 
     public function init()
@@ -124,7 +124,7 @@ class ai_mail_search extends rcube_plugin
     private function run_agentic_search($query, $api_key, $model, $storage, $max_results)
     {
         $tools = $this->agent_tools();
-        $system = $this->agent_system_prompt();
+        $system = $this->agent_system_prompt($storage);
         $messages = [['role' => 'user', 'content' => $query]];
 
         $seen = [];       // "folder\x00uid" => full item, accumulated across every search_emails call
@@ -224,13 +224,17 @@ class ai_mail_search extends rcube_plugin
                 'name' => 'search_emails',
                 'description' => 'Search the user\'s mailbox. You can call this more than once (up to '
                     . self::MAX_SEARCH_ROUNDS . ' times) — if a search returns nothing useful, or '
-                    . 'too much, adjust the parameters and search again rather than giving up.',
+                    . 'too much, adjust the parameters and search again rather than giving up. Prefer '
+                    . 'starting broad: one filter (or none) plus preview:true, then read the results to '
+                    . 'narrow down, rather than guessing several fields at once and AND-ing them together '
+                    . '— every extra filter you combine must ALL be exactly right, or you silently exclude '
+                    . 'the message you actually want.',
                 'input_schema' => [
                     'type' => 'object',
                     'properties' => [
                         'sender' => [
                             'type' => 'string',
-                            'description' => 'Filter by sender name or email address. Only for a sender-only request. Do not also set "to" to the same person to mean "to or from" — use "participant" instead.',
+                            'description' => 'Filter by sender name or email address. Only for a sender-only request. Do not also set "to" to the same person to mean "to or from" — use "participant" instead. Remember that for an automated/notification email (a form submission, receipt, invoice, calendar invite, alert), the sender is the service that sent it (e.g. "Formspree", "Stripe"), not the person named inside it — that person\'s name usually only appears in the body.',
                         ],
                         'to' => [
                             'type' => 'string',
@@ -238,7 +242,11 @@ class ai_mail_search extends rcube_plugin
                         ],
                         'participant' => [
                             'type' => 'string',
-                            'description' => 'Name or email of someone who is sender, recipient, or cc\'d. Use for "to or from X", "involving X", "with X" — direction unspecified.',
+                            'description' => 'Name or email of someone who is sender, recipient, or cc\'d. Use for "to or from X", "involving X", "with X" — direction unspecified. Don\'t use this for a person who is merely mentioned or named inside an email written/sent by someone else (e.g. a name inside a form submission) — they won\'t be in the headers at all; use "text" or "body" for that instead.',
+                        ],
+                        'text' => [
+                            'type' => 'string',
+                            'description' => 'An exact word/phrase to literal-match anywhere in the message — headers and body together. Good as a broad first pass when you\'re not sure whether the words will be in the subject, the body, or came from someone other than who you\'d expect (e.g. a name that only appears inside an automated notification\'s body, not its headers). Same substring-match caveat as subject/body: only for wording you\'re fairly confident is exact, and a hit alone isn\'t proof of relevance — check body_excerpt.',
                         ],
                         'subject' => [
                             'type' => 'string',
@@ -252,7 +260,7 @@ class ai_mail_search extends rcube_plugin
                         'before' => ['type' => 'string', 'description' => 'Only messages before this date, format YYYY-MM-DD'],
                         'unread' => ['type' => 'boolean', 'description' => 'Only unread messages'],
                         'flagged' => ['type' => 'boolean', 'description' => 'Only flagged/starred messages'],
-                        'folder' => ['type' => 'string', 'description' => 'Restrict to one folder, only if the user named one explicitly. Omit to search all folders.'],
+                        'folder' => ['type' => 'string', 'description' => 'Restrict to one folder, only if the user named one explicitly. Must be one of the real folder names listed in the system prompt, copied exactly — don\'t paraphrase or guess a folder name that isn\'t in that list. Omit to search all folders.'],
                         'sort' => [
                             'type' => 'string',
                             'enum' => ['newest_first', 'oldest_first'],
@@ -298,24 +306,51 @@ class ai_mail_search extends rcube_plugin
         ];
     }
 
-    private function agent_system_prompt()
+    private function agent_system_prompt($storage)
     {
         return 'Today\'s date is ' . gmdate('Y-m-d') . ' (UTC). Find the email(s) matching the '
             . 'user\'s request by calling search_emails (up to ' . self::MAX_SEARCH_ROUNDS . ' times) '
             . 'and, once you have looked at real results and are satisfied, present_results. Resolve '
-            . 'relative dates ("last week", "yesterday") against today\'s date. If a search returns '
-            . 'nothing, or clearly the wrong thing, don\'t give up — broaden or change the parameters '
-            . '(e.g. drop a literal subject/body guess, add preview:true to judge by content) and '
+            . 'relative dates ("last week", "yesterday") against today\'s date. Real folder names in '
+            . 'this mailbox: ' . $this->real_folder_list($storage) . '. If the user names a folder, '
+            . 'match it to exactly one of these (case-insensitive) for the folder parameter — never '
+            . 'invent or paraphrase a folder name that isn\'t in this list. On your first search, favor '
+            . 'a broad net — one filter, or none, plus preview:true — over guessing multiple fields and '
+            . 'AND-ing them together; you can always narrow on a later round once you\'ve actually seen '
+            . 'what\'s there, but an over-constrained first guess can silently exclude the message you '
+            . 'want with no sign anything went wrong. If a search returns nothing, or clearly the wrong '
+            . 'thing, don\'t give up — broaden or change the parameters (e.g. drop a literal subject/body '
+            . 'guess, try "text" instead of "sender"/"participant" if the person you want may only be '
+            . 'named in the body rather than the headers, add preview:true to judge by content) and '
             . 'search again rather than presenting an empty or wrong answer on the first try. Apply '
             . 'anything in the request that affects ordering or count (e.g. "chronological order" '
             . 'means oldest first, "just the last 3") when you present_results. For a request about '
-            . 'what someone said or a topic discussed, a body/subject filter matching is a hint to '
+            . 'what someone said or a topic discussed, a body/subject/text filter matching is a hint to '
             . 'investigate, not proof — it matches anywhere in the full raw message, including quoted '
             . 'replies and other people\'s signatures, which can coincidentally contain your search '
             . 'term with nothing to do with the actual request. Only present a message for a content '
             . 'request if its body_excerpt itself visibly supports it; if you can\'t confirm that after '
             . 'your searches, present_results with an empty list rather than guessing from a filter '
             . 'match you can\'t actually verify.';
+    }
+
+    /**
+     * A comma-separated list of real, searchable folder names, generated
+     * fresh from IMAP on every request — so the agent matches folder
+     * requests against what actually exists instead of guessing, and the
+     * list stays correct with no code change when folders are added, moved,
+     * or renamed.
+     */
+    private function real_folder_list($storage)
+    {
+        $trash = $this->rc->config->get('trash_mbox');
+        $junk = $this->rc->config->get('junk_mbox');
+
+        $folders = array_filter($storage->list_folders(), function ($folder) use ($trash, $junk) {
+            return $folder !== $trash && $folder !== $junk && stripos($folder, 'dovecot') !== 0;
+        });
+
+        return implode(', ', array_values($folders));
     }
 
     /**
@@ -421,6 +456,7 @@ class ai_mail_search extends rcube_plugin
             'to' => 'TO',
             'subject' => 'SUBJECT',
             'body' => 'BODY',
+            'text' => 'TEXT',
         ];
 
         foreach ($string_fields as $field => $keyword) {
