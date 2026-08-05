@@ -132,7 +132,7 @@ class ai_mail_search extends rcube_plugin
 
         for ($round = 1; $round <= self::MAX_SEARCH_ROUNDS; $round++) {
             $tool_choice = $round === 1
-                ? ['type' => 'tool', 'name' => 'search_emails']
+                ? ['type' => 'tool', 'name' => 'search_emails', 'disable_parallel_tool_use' => true]
                 : ['type' => 'any', 'disable_parallel_tool_use' => true];
 
             $data = $this->call_claude($api_key, $model, $system, $tools, $tool_choice, $messages);
@@ -175,7 +175,7 @@ class ai_mail_search extends rcube_plugin
                     'role' => 'user',
                     'content' => 'You are out of searches. Call present_results now with your final answer from what you have already seen.',
                 ];
-                $data = $this->call_claude($api_key, $model, $system, $tools, ['type' => 'tool', 'name' => 'present_results'], $messages);
+                $data = $this->call_claude($api_key, $model, $system, $tools, ['type' => 'tool', 'name' => 'present_results', 'disable_parallel_tool_use' => true], $messages);
                 $tool_use = $this->first_tool_use($data['content'] ?? []);
                 if ($tool_use && $tool_use['name'] === 'present_results') {
                     return $this->resolve_selection($tool_use['input']['selected'] ?? [], $seen);
