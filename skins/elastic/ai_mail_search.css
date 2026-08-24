@@ -15,12 +15,40 @@ a.button.ai-mail-search:before {
   mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E") center / contain no-repeat;
 }
 
+/*
+ * Below the 1201px breakpoint, Elastic moves this button out of the header
+ * and into the "..." popup menu (ul.popupmenu built by ui.js toolbar_init()),
+ * where two things break it:
+ * - core's unconditional `a.button.icon > span.inner { display: none }` hides
+ *   our label at every width, not just the desktop icon-only header — fine
+ *   there (sized by the header row), but with nothing else in flow it leaves
+ *   the popup <li> with zero content and zero height.
+ * - `.popover .menu li a::before { height: inherit !important }` outranks
+ *   our own height rule above by specificity, and inherited auto-height on
+ *   our empty content:'' mask collapses to 0 (unlike core's font-icon glyphs,
+ *   which stay sized because they're real glyph characters, not a masked box).
+ * Both need restoring, scoped to the popup so the desktop header is untouched.
+ */
+.popupmenu .ai-mail-search > span.inner {
+  display: inline !important;
+}
+
+.popover .menu li a.ai-mail-search:before,
+.popupmenu .ai-mail-search:before {
+  height: 1.75rem !important;
+  display: inline-block !important;
+  float: left !important;
+  width: 1.18em !important;
+  margin: 0 .5rem 0 0 !important;
+}
+
 .ai-mail-search-panel {
   display: none;
   position: fixed;
   top: 60px;
   right: 20px;
   width: 380px;
+  max-width: calc(100vw - 40px);
   max-height: 70vh;
   overflow-y: auto;
   background: #fff;
