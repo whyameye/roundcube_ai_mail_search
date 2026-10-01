@@ -104,14 +104,23 @@ function ai_mail_search_ui() {
           return; // let the browser handle it natively (new tab/window)
         }
         e.preventDefault();
-        // switch the message list to the message's folder and ask Roundcube
-        // to auto-select/scroll to this uid once that list finishes loading
-        // (env.list_uid is the same mechanism Roundcube's own "back to list"
-        // links use — see the 'list' response handler in app.js). Selecting
-        // the row natively triggers the reading-pane preview too, so we don't
-        // need a separate show_message() call.
-        rcmail.env.list_uid = item.uid;
-        rcmail.command('list', item.folder);
+
+        // load into the reading pane, same as a normal list-row preview —
+        // we know item.folder directly, so skip rcmail.show_message()/
+        // get_message_mailbox(), which only resolve the right folder for a
+        // uid already present in the currently loaded list. Fall back to a
+        // full-page navigation only if there's no reading pane at all (e.g.
+        // narrow/mobile layout).
+        var frameWin = rcmail.env.contentframe && rcmail.get_frame_window(rcmail.env.contentframe);
+        if (frameWin) {
+          var previewUrl = url.replace('&_action=show', '&_action=preview&_framed=1');
+          rcmail.show_contentframe(true);
+          rcmail.location_href(previewUrl, frameWin, true);
+          rcmail.preview_id = item.uid;
+        }
+        else {
+          rcmail.location_href(url, window, true);
+        }
         hide();
       });
     });

@@ -260,7 +260,11 @@ class ai_mail_search extends rcube_plugin
                         'before' => ['type' => 'string', 'description' => 'Only messages before this date, format YYYY-MM-DD'],
                         'unread' => ['type' => 'boolean', 'description' => 'Only unread messages'],
                         'flagged' => ['type' => 'boolean', 'description' => 'Only flagged/starred messages'],
-                        'folder' => ['type' => 'string', 'description' => 'Restrict to one folder, only if the user named one explicitly. Must be one of the real folder names listed in the system prompt, copied exactly — don\'t paraphrase or guess a folder name that isn\'t in that list. Omit to search all folders.'],
+                        'folder' => ['type' => 'string', 'description' => 'Restrict to one folder, only if the user named one explicitly. Must be one of the real folder names listed in the system prompt, copied exactly — don\'t paraphrase or guess a folder name that isn\'t in that list. Omit to search all folders. Required alongside "uid", since a UID is only unique within one folder.'],
+                        'uid' => [
+                            'type' => 'string',
+                            'description' => 'Exact message UID to fetch directly — only when the user has given you a literal UID number they want opened (e.g. "UID 231", pasted from elsewhere), never as a guess. Must be paired with folder; if you don\'t know which folder it\'s in, search some other way first instead of guessing one. When set, every other filter is ignored and this fetches that exact message instead of searching.',
+                        ],
                         'sort' => [
                             'type' => 'string',
                             'enum' => ['newest_first', 'oldest_first'],
@@ -331,7 +335,10 @@ class ai_mail_search extends rcube_plugin
             . 'term with nothing to do with the actual request. Only present a message for a content '
             . 'request if its body_excerpt itself visibly supports it; if you can\'t confirm that after '
             . 'your searches, present_results with an empty list rather than guessing from a filter '
-            . 'match you can\'t actually verify.';
+            . 'match you can\'t actually verify. If the user gives you a literal message UID together '
+            . 'with a folder (e.g. "UID 231 in INBOX"), pass them as the uid and folder parameters on '
+            . 'search_emails to fetch that exact message directly, instead of treating the number as '
+            . 'search text.';
     }
 
     /**
@@ -359,6 +366,18 @@ class ai_mail_search extends rcube_plugin
      */
     private function execute_search_emails($storage, array $params, $default_max_results)
     {
+        if (!empty($params['uid']) && is_string($params['uid']) && !empty($params['folder']) && is_string($params['folder'])) {
+            $folders = $this->resolve_folders($storage, $params);
+            if (count($folders) === 1) {
+                $item = $this->fetch_single_by_uid($storage, $folders[0], $params['uid']);
+                $items = $item ? [$item] : [];
+                if ($items && !empty($params['preview'])) {
+                    $items = $this->fetch_excerpts($items);
+                }
+                return $items;
+            }
+        }
+
         $criteria = $this->build_criteria($params);
         $folders = $this->resolve_folders($storage, $params);
         $sort = ($params['sort'] ?? '') === 'oldest_first' ? 'oldest_first' : 'newest_first';
@@ -554,15 +573,7 @@ class ai_mail_search extends rcube_plugin
             $headers = $storage->fetch_headers($folder, $uids, false);
 
             foreach ($headers as $header) {
-                $timestamp = rcube_utils::strtotime($header->date);
-                $all[] = [
-                    'folder' => $folder,
-                    'uid' => (string) $header->uid,
-                    'subject' => $header->subject !== '' ? $header->subject : $this->gettext('nosubject'),
-                    'from' => $header->from,
-                    'date' => $this->rc->format_date($header->date),
-                    'timestamp' => $timestamp ?: 0,
-                ];
+                $all[] = $this->header_to_item($folder, $header);
             }
         }
 
@@ -580,6 +591,34 @@ class ai_mail_search extends rcube_plugin
         }
 
         return $limited;
+    }
+
+    private function header_to_item($folder, $header)
+    {
+        $timestamp = rcube_utils::strtotime($header->date);
+        return [
+            'folder' => $folder,
+            'uid' => (string) $header->uid,
+            'subject' => $header->subject !== '' ? $header->subject : $this->gettext('nosubject'),
+            'from' => $header->from,
+            'date' => $this->rc->format_date($header->date),
+            'timestamp' => $timestamp ?: 0,
+        ];
+    }
+
+    /**
+     * Fetch one message by its exact UID within a single resolved folder, for
+     * a search_emails call made with uid+folder set — bypasses IMAP SEARCH
+     * criteria entirely since the identity is already known.
+     */
+    private function fetch_single_by_uid($storage, $folder, $uid)
+    {
+        $headers = $storage->fetch_headers($folder, [(int) $uid], false);
+        if (!$headers) {
+            return null;
+        }
+
+        return $this->header_to_item($folder, reset($headers));
     }
 
     /**
